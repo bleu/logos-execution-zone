@@ -388,13 +388,13 @@ fn settled_peer_block(
     let (summary, payout, reverted) =
         chain_state::apply::derive_block_summary(state, &txs, id, timestamp)
             .expect("test transactions settle");
-    let mut transactions = txs;
+    let mut transactions = vec![LeeTransaction::Public(clock_invocation(id, timestamp))];
+    transactions.extend(txs);
     transactions.push(LeeTransaction::Public(fee_invocation(
         summary,
         payout,
         FeePayee::Present(producer),
     )));
-    transactions.push(LeeTransaction::Public(clock_invocation(id, timestamp)));
     HashableBlockData {
         block_id: id,
         prev_block_hash: prev_hash,
@@ -405,14 +405,12 @@ fn settled_peer_block(
     .into_pending_block()
 }
 
-/// Asserts the block body is `user_txs` followed by the forced fee invocation
-/// (whatever summary it settled to) and the canonical clock invocation.
-fn assert_block_tail(block: &common::block::Block, user_txs: &[LeeTransaction]) {
-    let txs = &block.body.transactions;
-    assert_eq!(&txs[..user_txs.len()], user_txs, "user transactions differ");
-    let [fee_tx, clock_tx] = &txs[user_txs.len()..] else {
-        panic!("expected exactly the fee + clock tail");
+/// Checks the canonical clock, user transactions, and final fee invocation.
+fn assert_block_layout(block: &common::block::Block, user_txs: &[LeeTransaction]) {
+    let [clock_tx, middle @ .., fee_tx] = block.body.transactions.as_slice() else {
+        panic!("expected clock and fee transactions");
     };
+    assert_eq!(middle, user_txs, "user transactions differ");
     let LeeTransaction::Public(fee_tx) = fee_tx else {
         panic!("fee tx must be public");
     };
@@ -665,6 +663,7 @@ fn cross_zone_test_config() -> SequencerConfig {
                     mint_cap: None,
                 }],
                 min_committee_size: 0,
+                genesis_hash: None,
             }],
             source_authority: None,
             source_governance: None,
@@ -1442,7 +1441,7 @@ async fn unused_declared_gas_is_recredited_after_settlement() {
         .await
         .unwrap()
         .unwrap();
-    assert_block_tail(&block, &transfers);
+    assert_block_layout(&block, &transfers);
 }
 
 #[tokio::test]
@@ -1488,7 +1487,8 @@ async fn a_block_full_of_charged_gas_defers_the_rest() {
         .await
         .unwrap()
         .unwrap();
-    assert_block_tail(&block, &transfers[..1]);
+    assert_block_layout(&block, &transfers[..1]);
+    assert_eq!(block.body.reverted, vec![1]);
 
     // Deferred, not dropped: it leads the next block.
     let block_id = sequencer.run_production_turn().await.unwrap();
@@ -1498,7 +1498,7 @@ async fn a_block_full_of_charged_gas_defers_the_rest() {
         .await
         .unwrap()
         .unwrap();
-    assert_block_tail(&block, &transfers[1..]);
+    assert_block_layout(&block, &transfers[1..]);
 }
 
 #[tokio::test]
@@ -1544,7 +1544,7 @@ async fn an_over_cap_transaction_is_dropped_not_deferred() {
         .await
         .unwrap()
         .unwrap();
-    assert_block_tail(&block, std::slice::from_ref(&normal));
+    assert_block_layout(&block, std::slice::from_ref(&normal));
 
     // Nothing was deferred: the next block carries no user transactions.
     let block_id = sequencer.run_production_turn().await.unwrap();
@@ -1554,7 +1554,7 @@ async fn an_over_cap_transaction_is_dropped_not_deferred() {
         .await
         .unwrap()
         .unwrap();
-    assert_block_tail(&block, &[]);
+    assert_block_layout(&block, &[]);
 }
 
 #[test]
@@ -1720,6 +1720,45 @@ async fn build_block_from_mempool() {
     assert_eq!(sequencer.chain_height().await, genesis_height);
 }
 
+#[tokio::test]
+async fn the_clock_does_not_use_a_user_transaction_slot() {
+    let mut config = setup_sequencer_config();
+    config.max_num_tx_in_block = 2;
+    let (mut sequencer, mempool_handle) = start_sequencer(config).await;
+    let transfers: Vec<_> = (0..3)
+        .map(|nonce| {
+            common::test_utils::create_transaction_native_token_transfer(
+                initial_public_user_accounts()[0].account_id,
+                nonce,
+                initial_public_user_accounts()[1].account_id,
+                10,
+                &create_signing_key_for_account1(),
+            )
+        })
+        .collect();
+    for tx in &transfers {
+        mempool_handle
+            .push((TransactionOrigin::User, tx.clone()))
+            .await
+            .unwrap();
+    }
+
+    let first_id = sequencer.run_production_turn().await.unwrap();
+    let first = block_at(&sequencer, first_id).await.unwrap();
+    assert_block_layout(&first, &transfers[..2]);
+    let second_id = sequencer.run_production_turn().await.unwrap();
+    let second = block_at(&sequencer, second_id).await.unwrap();
+    assert_block_layout(&second, &transfers[2..]);
+}
+
+#[tokio::test]
+async fn an_empty_block_has_clock_first_and_fee_last() {
+    let (mut sequencer, _mempool_handle) = start_sequencer(setup_sequencer_config()).await;
+    let (built, _state) = sequencer.build_block_from_mempool_at(1_000).await.unwrap();
+    assert_block_layout(&built.block, &[]);
+    assert!(built.block.body.reverted.is_empty());
+}
+
 /// A live channel sitting at the config entry [`mock::checkpoint_at`] calls
 /// finalized.
 fn live_channel(keys: Vec<Ed25519PublicKey>) -> LiveChannelConfig {
@@ -1817,8 +1856,8 @@ async fn replay_transactions_are_rejected_in_the_same_block() {
         .unwrap()
         .unwrap();
 
-    // Only one user tx should be included; the fee and clock txs are always appended last.
-    assert_block_tail(&block, std::slice::from_ref(&tx));
+    // Only one user transaction should be included between the clock and fee.
+    assert_block_layout(&block, std::slice::from_ref(&tx));
 }
 
 #[tokio::test]
@@ -1848,7 +1887,7 @@ async fn replay_transactions_are_rejected_in_different_blocks() {
         .await
         .unwrap()
         .unwrap();
-    assert_block_tail(&block, std::slice::from_ref(&tx));
+    assert_block_layout(&block, std::slice::from_ref(&tx));
 
     // Add same transaction should fail
     mempool_handle
@@ -1865,7 +1904,7 @@ async fn replay_transactions_are_rejected_in_different_blocks() {
         .unwrap()
         .unwrap();
     // The replay is rejected, so only the fee and clock txs are in the block.
-    assert_block_tail(&block, &[]);
+    assert_block_layout(&block, &[]);
 }
 
 #[tokio::test]
@@ -1903,7 +1942,7 @@ async fn restart_from_storage() {
             .await
             .unwrap()
             .unwrap();
-        assert_block_tail(&block, std::slice::from_ref(&tx));
+        assert_block_layout(&block, std::slice::from_ref(&tx));
         sequencer.storage_ref.downgrade()
     };
     storage_weak.wait_for_shutdown_with_result(|_| ()).await;
@@ -2020,13 +2059,13 @@ async fn produce_block_with_correct_prev_meta_after_restart() {
         new_block.header.prev_block_hash, expected_prev_meta.hash,
         "New block's prev_block_hash should match the stored metadata hash"
     );
-    assert_block_tail(&new_block, std::slice::from_ref(&tx));
+    assert_block_layout(&new_block, std::slice::from_ref(&tx));
 }
 
-#[tokio::test]
-async fn user_tx_that_chain_calls_clock_is_dropped() {
-    let (mut sequencer, mempool_handle) = common_setup().await;
-
+async fn deploy_clock_reader(
+    sequencer: &mut SequencerCore<StorageActor, MockBedrockActor>,
+    mempool_handle: &MemPoolHandle<(TransactionOrigin, LeeTransaction)>,
+) -> AccountId {
     let clock_reader = test_programs::clock_reader();
 
     // Deploy `clock_reader` at the header account `clock_reader_id`, which signs for its own
@@ -2101,6 +2140,120 @@ async fn user_tx_that_chain_calls_clock_is_dropped() {
         .unwrap();
     sequencer.run_production_turn().await.unwrap();
 
+    clock_reader_id
+}
+
+#[tokio::test]
+async fn clock_reads_current_block_values() {
+    let (mut sequencer, mempool_handle) = start_sequencer(setup_sequencer_config()).await;
+    let clock_reader_id = deploy_clock_reader(&mut sequencer, &mempool_handle).await;
+    let (parent_tip, parent_state) = {
+        let chain = sequencer.chain.lock().await;
+        (
+            chain
+                .head_tip()
+                .expect("deployment leaves a head tip")
+                .clone(),
+            chain.head_state().clone(),
+        )
+    };
+    let parent_block = block_at(&sequencer, parent_tip.block_id)
+        .await
+        .expect("deployment block is stored");
+    let timestamp = parent_block.header.timestamp.checked_add(1_000).unwrap();
+    let payer = &initial_pub_accounts_private_keys()[0];
+    let payer_nonce = parent_state.get_account_by_id(payer.account_id).nonce;
+    let readers = [
+        Actor::new(payer.account_id, clock_reader_id),
+        Actor::new(
+            initial_public_user_accounts()[1].account_id,
+            clock_reader_id,
+        ),
+    ];
+    let read_txs: Vec<_> = readers
+        .iter()
+        .zip([
+            clock_core::Message::ReadTimestamp { granularity: 1 },
+            clock_core::Message::ReadBlockId { granularity: 1 },
+        ])
+        .enumerate()
+        .map(|(index, (reader, clock_message))| {
+            let nonce = Nonce(
+                payer_nonce
+                    .0
+                    .checked_add(u128::try_from(index).unwrap())
+                    .unwrap(),
+            );
+            let message = lee::public_transaction::Message::try_new_with_fees(
+                *reader,
+                vec![*reader, system_accounts::clock_actor()],
+                signer_nonces(&[&payer.pub_sign_key], vec![nonce]),
+                clock_message,
+                common::test_utils::test_fee_declaration(payer.account_id),
+            )
+            .unwrap();
+            let witness_set =
+                lee::public_transaction::WitnessSet::for_message(&message, &[&payer.pub_sign_key]);
+            LeeTransaction::Public(PublicTransaction::new(message, witness_set))
+        })
+        .collect();
+    for tx in &read_txs {
+        mempool_handle
+            .push((TransactionOrigin::User, tx.clone()))
+            .await
+            .unwrap();
+    }
+
+    let (built, producer_state) = sequencer
+        .build_block_from_mempool_at(timestamp)
+        .await
+        .unwrap();
+    let block = built.block;
+    for tx in &read_txs {
+        assert!(
+            block.body.transactions.contains(tx),
+            "clock read must be included"
+        );
+    }
+    let replies = |state: &V03State| {
+        readers.map(|reader| {
+            borsh::from_slice::<clock_core::Reply>(
+                state
+                    .get_account_by_id(reader.account_id)
+                    .data
+                    .actor_state(clock_reader_id)
+                    .as_ref(),
+            )
+            .expect("reader must store the clock reply")
+        })
+    };
+    assert_eq!(
+        replies(&producer_state),
+        [
+            clock_core::Reply::Timestamp(block.header.timestamp),
+            clock_core::Reply::BlockId(block.header.block_id),
+        ],
+        "clock reads must return the produced block values; parent timestamp {}, parent block id {}",
+        parent_block.header.timestamp,
+        parent_tip.block_id,
+    );
+
+    let mut replay_state = parent_state;
+    chain_state::apply_block(Some(&parent_tip), &block, &mut replay_state)
+        .expect("the produced block must replay from its parent");
+    assert_eq!(replies(&replay_state), replies(&producer_state));
+    assert!(
+        replay_state == producer_state,
+        "replay must reproduce producer state"
+    );
+}
+
+#[tokio::test]
+async fn user_tx_that_chain_calls_clock_is_dropped() {
+    let (mut sequencer, mempool_handle) = common_setup().await;
+    let clock_reader_id = deploy_clock_reader(&mut sequencer, &mempool_handle).await;
+    let payer = &initial_pub_accounts_private_keys()[0];
+
     // A funded payer calls `clock_reader`, which forwards `clock_message` to the clock.
     let clock = system_accounts::clock_actor();
     let caller = Actor::new(payer.account_id, clock_reader_id);
@@ -2118,12 +2271,12 @@ async fn user_tx_that_chain_calls_clock_is_dropped() {
         LeeTransaction::Public(lee::PublicTransaction::new(message, witness_set))
     };
 
-    // A tick for the block being produced passes the clock's own check, so only the
+    // A tick after the canonical tick passes the clock's own check, so only the
     // restricted-account guard can drop it.
     let tick_block_id = sequencer.chain_height().await + 1;
     let tick = user_tx(&clock_core::Message::Tick {
         timestamp: 0,
-        block_id: tick_block_id,
+        block_id: tick_block_id + 1,
     });
     mempool_handle
         .push((TransactionOrigin::User, tick))
@@ -2133,7 +2286,7 @@ async fn user_tx_that_chain_calls_clock_is_dropped() {
     let block = block_at(&sequencer, tick_block_id)
         .await
         .expect("The turn should produce the tick's block");
-    assert_block_tail(&block, &[]);
+    assert_block_layout(&block, &[]);
 
     // The same transaction with a read-only message is included, so the setup is sound.
     let read = user_tx(&clock_core::Message::ReadBlockId { granularity: 1 });
@@ -2145,7 +2298,7 @@ async fn user_tx_that_chain_calls_clock_is_dropped() {
     let block = block_at(&sequencer, tick_block_id + 1)
         .await
         .expect("The turn should produce a block");
-    assert_block_tail(&block, &[read]);
+    assert_block_layout(&block, &[read]);
 }
 
 #[tokio::test]
@@ -2175,7 +2328,7 @@ async fn block_production_aborts_when_clock_account_data_is_corrupted() {
         .await
         .unwrap();
 
-    // Block production must fail because the appended clock tx cannot execute.
+    // Block production must fail because the clock transaction cannot execute.
     let result = sequencer.run_production_turn().await;
     assert!(
         result.is_err(),
@@ -2520,7 +2673,7 @@ fn resubmittable_txs_drops_clock_and_bridge_deposits() {
         vec![user_tx.clone(), deposit_tx, withdraw_tx.clone()],
     );
 
-    // The trailing clock tx and the sequencer-generated deposit are dropped;
+    // The clock, fee, and sequencer-generated deposit are dropped;
     // user txs (withdrawals included) are returned.
     assert_eq!(resubmittable_txs(&block), vec![user_tx, withdraw_tx]);
 }
@@ -3806,8 +3959,11 @@ async fn a_conflict_dropping_our_block_reverts_it_and_requeues_its_user_txs() {
     assert_eq!(requeued, tx);
     assert!(
         sequencer.mempool.pop().is_none(),
-        "the clock tx must not be requeued"
+        "the old clock and fee transactions must not be requeued"
     );
+    sequencer.mempool.push_front((origin, requeued));
+    let (rebuilt, _state) = sequencer.build_block_from_mempool_at(1_000).await.unwrap();
+    assert_block_layout(&rebuilt.block, &[tx]);
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use anyhow::{Result, ensure};
 use bridge_core::BridgeAmount;
 pub use bridge_core::DepositRecipient;
 use common::config::BasicAuth;
-pub use cross_zone_inbox_core::{CrossZoneConfig, CrossZonePeer, CrossZoneRoute};
+pub use cross_zone::{CrossZoneConfig, CrossZonePeer, CrossZoneRoute};
 use humantime_serde;
 use lee::{AccountId, PublicKey, Signature};
 use logos_blockchain_core::mantle::ops::channel::ChannelId;
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Bytes reserved out of `max_block_size` for the block header plus the forced
-/// fee and clock tail transactions; RPC and gossip cap a single transaction at
+/// clock and fee transactions; RPC and gossip cap a single transaction at
 /// `max_block_size - BLOCK_OVERHEAD`.
 pub const BLOCK_OVERHEAD: u64 = 2_048;
 

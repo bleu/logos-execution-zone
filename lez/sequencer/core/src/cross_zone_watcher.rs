@@ -45,6 +45,8 @@ struct PeerContext {
     /// Below this live committee size the watcher suspends; 0 disables the
     /// floor and skips the committee read entirely.
     min_committee_size: u32,
+    /// Pin for the peer's genesis hash; `None` anchors on the first read.
+    genesis_hash: Option<HashType>,
     /// The watcher's own handle for the committee read; the connection inside
     /// `ZoneIndexer` is consumed by the message stream.
     node: TimeoutNode<NodeHttpClient>,
@@ -185,6 +187,17 @@ async fn set_cross_zone_peer_floor<S: StorageActorTrait>(
     Ok(())
 }
 
+/// Says when a configured genesis pin cannot take effect: it is only checked
+/// when a chain tip is first established, and this watcher already holds one.
+fn warn_if_pin_unevaluated(peer: &PeerContext, tip: Option<&PeerChainTip>) {
+    if peer.genesis_hash.is_some() && tip.is_some() {
+        warn!(
+            "Watcher for peer {} has a genesis pin configured but is already anchored; the pin applies only if the watcher re-anchors.",
+            hex::encode(peer.peer_zone)
+        );
+    }
+}
+
 /// Drops the stored floor so the watcher reads `peer_zone`'s channel from the
 /// peer's genesis again.
 async fn clear_cross_zone_peer_floor<S: StorageActorTrait>(
@@ -237,6 +250,7 @@ pub fn spawn_watchers<S: StorageActorTrait>(
                 peer_zone: peer.channel_id,
                 self_zone,
                 min_committee_size: peer.min_committee_size,
+                genesis_hash: peer.genesis_hash,
                 node: floor_node,
             },
             poll_interval,
@@ -294,6 +308,7 @@ async fn watch_peer<S: StorageActorTrait>(
             return;
         }
     };
+    warn_if_pin_unevaluated(&peer, tip.as_ref());
     let resume = resume_from(tip, floor);
     if resume.clear_floor {
         error!(
@@ -508,7 +523,9 @@ where
                 // treated as the end of the chain: the peer's own next honest
                 // block still links to the tip.
                 let link = match screen_peer_block(&block) {
-                    Ok(recomputed) => link_to_tip(tip.as_ref(), &block, recomputed),
+                    Ok(recomputed) => {
+                        link_to_tip(tip.as_ref(), &block, recomputed, peer.genesis_hash)
+                    }
                     Err(refusal) => {
                         skipped = skipped.saturating_add(1);
                         warn!(
@@ -649,6 +666,10 @@ async fn record_block_deliveries<S: StorageActorTrait>(
     // RocksDBIO::add_pending_cross_zone_dispatches.
     let mut deliveries = Vec::new();
     for (index, tx) in block.body.transactions.iter().enumerate() {
+        // Effects did not take; the verifier refuses the dispatch identically.
+        if block.body.is_reverted(index) {
+            continue;
+        }
         let LeeTransaction::Public(public_tx) = tx else {
             continue;
         };
@@ -754,6 +775,7 @@ mod tests {
     use cross_zone::test_utils::{linked_chain_to, ping_emission};
     use futures::stream;
     use kameo::actor::Spawn as _;
+    use lee::GENESIS_BLOCK_ID;
     use logos_blockchain_core::mantle::ops::channel::{MsgId, inscribe::Inscription};
     use logos_blockchain_zone_sdk::{UnverifiedEd25519PublicKey, ZoneBlock};
     use sequencer_storage_actor::{
@@ -773,6 +795,7 @@ mod tests {
             peer_zone: PEER_ZONE,
             self_zone: SELF_ZONE,
             min_committee_size: 0,
+            genesis_hash: None,
             node: TimeoutNode::new(NodeHttpClient::new(
                 CommonHttpClient::new(None),
                 "http://127.0.0.1:0".parse().expect("valid url"),
@@ -880,6 +903,18 @@ mod tests {
     /// A stream item carrying the peer's block `block_id`.
     fn peer_block_msg(block_id: u64, slot: u64) -> (ZoneMessage, Slot) {
         block_msg(&chain_block(block_id), slot)
+    }
+
+    /// A stream item carrying the peer's block `block_id`, its one emission reverted.
+    fn peer_block_msg_reverted(block_id: u64, slot: u64) -> (ZoneMessage, Slot) {
+        let prefix = chain_to(block_id.saturating_sub(1));
+        let block = common::test_utils::produce_dummy_block_with_reverted(
+            block_id,
+            prefix.last().map(|block| block.header.hash),
+            vec![emission()],
+            vec![0],
+        );
+        block_msg(&block, slot)
     }
 
     /// A stream item carrying a block whose one emission targets
@@ -1062,9 +1097,31 @@ mod tests {
             Some(Slot::from(1)),
             "the cursor must be durable, not just in memory"
         );
-        let mut expected = vec![message_key(&PEER_ZONE, 1, 0), message_key(&PEER_ZONE, 2, 0)];
+        let mut expected = vec![message_key(&PEER_ZONE, 1, 1), message_key(&PEER_ZONE, 2, 1)];
         expected.sort_unstable();
         assert_eq!(recorded_keys(&storage_ref).await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_reverted_emission_is_never_recorded() {
+        let (_dir, storage_ref) = store().await;
+        let mut cursor = None;
+        let mut tip = None;
+
+        let outcome = consume_peer_stream(
+            stream::iter(vec![peer_block_msg_reverted(1, 0)]),
+            &peer_context(),
+            &storage_ref,
+            &mut cursor,
+            &mut tip,
+        )
+        .await;
+
+        assert_eq!(outcome, PassOutcome::Drained);
+        assert!(
+            recorded_keys(&storage_ref).await.is_empty(),
+            "an emission whose transaction reverted must not be delivered"
+        );
     }
 
     #[tokio::test]
@@ -1164,7 +1221,7 @@ mod tests {
         assert_eq!(records.len(), 1, "the delivery must be recorded");
         assert_eq!(
             records[0].message_key,
-            message_key(&PEER_ZONE, 1, 0),
+            message_key(&PEER_ZONE, 1, 1),
             "the record is keyed by the message it delivers, so a replay is not double-tracked"
         );
         assert!(
@@ -1304,9 +1361,9 @@ mod tests {
         .await;
 
         let mut expected = vec![
-            message_key(&PEER_ZONE, 1, 0),
-            message_key(&PEER_ZONE, 2, 0),
-            message_key(&PEER_ZONE, 3, 0),
+            message_key(&PEER_ZONE, 1, 1),
+            message_key(&PEER_ZONE, 2, 1),
+            message_key(&PEER_ZONE, 3, 1),
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -1352,7 +1409,7 @@ mod tests {
         );
         assert_eq!(
             recorded_keys(&storage_ref).await,
-            vec![message_key(&PEER_ZONE, 1, 0)],
+            vec![message_key(&PEER_ZONE, 1, 1)],
             "the block after the failure is unread"
         );
     }
@@ -1385,7 +1442,7 @@ mod tests {
         );
         assert_eq!(
             recorded_keys(&storage_ref).await,
-            vec![message_key(&PEER_ZONE, 1, 0)]
+            vec![message_key(&PEER_ZONE, 1, 1)]
         );
     }
 
@@ -1416,7 +1473,7 @@ mod tests {
 
         assert_eq!(
             recorded_keys(&storage_ref).await,
-            vec![message_key(&PEER_ZONE, 1, 0)],
+            vec![message_key(&PEER_ZONE, 1, 1)],
             "no pass reads past the slot it cannot decode"
         );
         assert_eq!(
@@ -1433,8 +1490,8 @@ mod tests {
     async fn a_block_claiming_an_id_ahead_of_the_chain_is_not_delivered_from() {
         // The #677 suppression, end to end. The peer inscribes a block claiming
         // id 5 while its chain is at 1. Delivered, it would burn
-        // message_key(PEER_ZONE, 5, 0), and the honest block 5 carrying a real
-        // message at index 0 would then be refused by the inbox as a replay,
+        // message_key(PEER_ZONE, 5, 1), and the honest block 5 carrying a real
+        // message at index 1 would then be refused by the inbox as a replay,
         // with the funds behind it already escrowed on the peer.
         //
         // The honest blocks behind it still deliver: stopping here would cost
@@ -1460,9 +1517,9 @@ mod tests {
 
         assert_eq!(outcome, PassOutcome::Drained);
         let mut expected = vec![
-            message_key(&PEER_ZONE, 1, 0),
-            message_key(&PEER_ZONE, 2, 0),
-            message_key(&PEER_ZONE, 3, 0),
+            message_key(&PEER_ZONE, 1, 1),
+            message_key(&PEER_ZONE, 2, 1),
+            message_key(&PEER_ZONE, 3, 1),
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -1475,7 +1532,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_block_at_a_delivered_id_is_not_delivered_from() {
-        // Both claim id 2, so on chain both deliveries key on (PEER_ZONE, 2, 0)
+        // Both claim id 2, so on chain both deliveries key on (PEER_ZONE, 2, 1)
         // and the second is a replay the inbox refuses.
         let (_dir, storage_ref) = store().await;
         let mut cursor = None;
@@ -1500,7 +1557,7 @@ mod tests {
             PassOutcome::Drained,
             "a peer equivocating about its own chain is not this node's failure"
         );
-        let mut expected = vec![message_key(&PEER_ZONE, 1, 0), message_key(&PEER_ZONE, 2, 0)];
+        let mut expected = vec![message_key(&PEER_ZONE, 1, 1), message_key(&PEER_ZONE, 2, 1)];
         expected.sort_unstable();
         assert_eq!(
             recorded_keys(&storage_ref).await,
@@ -1533,7 +1590,7 @@ mod tests {
         .await;
 
         assert_eq!(outcome, PassOutcome::Drained);
-        let mut expected = vec![message_key(&PEER_ZONE, 1, 0), message_key(&PEER_ZONE, 2, 0)];
+        let mut expected = vec![message_key(&PEER_ZONE, 1, 1), message_key(&PEER_ZONE, 2, 1)];
         expected.sort_unstable();
         assert_eq!(
             recorded_keys(&storage_ref).await,
@@ -1571,6 +1628,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pinned_genesis_anchors_only_on_the_pinned_chain() {
+        let (_dir, storage_ref) = store().await;
+        let mut cursor = None;
+        let mut tip = None;
+        let pinned_elsewhere = PeerContext {
+            genesis_hash: Some(HashType([9; 32])),
+            ..peer_context()
+        };
+
+        let outcome = consume_peer_stream(
+            stream::iter(vec![peer_block_msg(GENESIS_BLOCK_ID, 0)]),
+            &pinned_elsewhere,
+            &storage_ref,
+            &mut cursor,
+            &mut tip,
+        )
+        .await;
+
+        assert_eq!(outcome, PassOutcome::Stranded);
+        assert!(recorded_keys(&storage_ref).await.is_empty());
+        assert_eq!(tip, None, "a genesis off the pin never anchors");
+
+        let pinned_here = PeerContext {
+            genesis_hash: Some(chain_hash(GENESIS_BLOCK_ID)),
+            ..peer_context()
+        };
+        let anchored = consume_peer_stream(
+            stream::iter(vec![peer_block_msg(GENESIS_BLOCK_ID, 1)]),
+            &pinned_here,
+            &storage_ref,
+            &mut cursor,
+            &mut tip,
+        )
+        .await;
+
+        assert_eq!(anchored, PassOutcome::Drained);
+        assert_eq!(
+            tip,
+            Some(tip_at(GENESIS_BLOCK_ID)),
+            "the pinned genesis anchors"
+        );
+    }
+
+    #[tokio::test]
     async fn a_tampered_header_hash_is_not_delivered_from() {
         // As correctly signed as any other block, since the signature does not
         // cover `header.hash`. Block 2 arriving behind it still delivers.
@@ -1594,7 +1695,7 @@ mod tests {
         .await;
 
         assert_eq!(outcome, PassOutcome::Drained);
-        let mut expected = vec![message_key(&PEER_ZONE, 1, 0), message_key(&PEER_ZONE, 2, 0)];
+        let mut expected = vec![message_key(&PEER_ZONE, 1, 1), message_key(&PEER_ZONE, 2, 1)];
         expected.sort_unstable();
         assert_eq!(recorded_keys(&storage_ref).await, expected);
         assert_eq!(tip, Some(tip_at(2)));
